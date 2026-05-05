@@ -21,8 +21,20 @@ function Write-Skip    { param([string]$Msg) Write-Host "[-] $Msg" -ForegroundCo
 function Write-Fail    { param([string]$Msg) Write-Host "[!] $Msg" -ForegroundColor Red     }
 
 # ─────────────────────────────────────────────────────────────
-#  Helper: Safe remove (file / folder)
+#  Helper: Take ownership + grant full control, then delete
 # ─────────────────────────────────────────────────────────────
+function Force-TakeOwnership {
+    param([string]$Path)
+    try {
+        # Take ownership via takeown
+        takeown /F $Path /R /D Y 2>&1 | Out-Null
+        # Grant Administrators full control via icacls
+        icacls $Path /grant "Administrators:(OI)(CI)F" /T /C /Q 2>&1 | Out-Null
+    } catch {
+        # Non-fatal — best effort
+    }
+}
+
 function Remove-IfExists {
     param([string]$Path)
     if (Test-Path $Path) {
@@ -30,7 +42,15 @@ function Remove-IfExists {
             Remove-Item -Path $Path -Recurse -Force -ErrorAction Stop
             Write-Success "Removed: $Path"
         } catch {
-            Write-Fail "Could not remove: $Path — $($_.Exception.Message)"
+            # Access denied — take ownership and retry
+            Write-Status "Access denied, taking ownership: $Path"
+            Force-TakeOwnership $Path
+            try {
+                Remove-Item -Path $Path -Recurse -Force -ErrorAction Stop
+                Write-Success "Removed (after ownership fix): $Path"
+            } catch {
+                Write-Fail "Still could not remove: $Path — $($_.Exception.Message)"
+            }
         }
     } else {
         Write-Skip "Not found (skip): $Path"
@@ -59,7 +79,7 @@ function Remove-RegIfExists {
 # ═════════════════════════════════════════════════════════════
 Write-Host ""
 Write-Host "══════════════════════════════════════════════" -ForegroundColor DarkGray
-Write-Host "   Google Chrome Cleanup Tool"                  -ForegroundColor White
+Write-Host "   Google Chrome — Full Removal Script"         -ForegroundColor White
 Write-Host "══════════════════════════════════════════════" -ForegroundColor DarkGray
 Write-Host ""
 
