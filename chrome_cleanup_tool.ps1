@@ -24,12 +24,10 @@ function Write-Fail    { param([string]$Msg) Write-Host "[!] $Msg" -ForegroundCo
 #  Helper: Take ownership + grant full control, then delete
 # ─────────────────────────────────────────────────────────────
 function Force-TakeOwnership {
-    param([string]$Path)
+    param([string]$FolderPath)
     try {
-        # Take ownership via takeown
-        takeown /F $Path /R /D Y 2>&1 | Out-Null
-        # Grant Administrators full control via icacls
-        icacls $Path /grant "Administrators:(OI)(CI)F" /T /C /Q 2>&1 | Out-Null
+        takeown /F "$FolderPath" /R /D Y 2>&1 | Out-Null
+        icacls "$FolderPath" /grant "Administrators:(OI)(CI)F" /T /C /Q 2>&1 | Out-Null
     } catch {
         # Non-fatal — best effort
     }
@@ -94,7 +92,6 @@ foreach ($p in $ChromeInstallPaths) {
     if (Test-Path $p) { $ChromeFound = $true; break }
 }
 
-# Also check registry for install record
 $RegInstallPaths = @(
     "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe",
     "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Google Chrome",
@@ -115,21 +112,59 @@ Write-Status "Chrome installation detected. Beginning full removal..."
 Write-Host ""
 
 # ═════════════════════════════════════════════════════════════
-#  STEP 2 — Kill any running Chrome processes
+#  STEP 2 — Aggressively kill ALL Chrome-related processes
+#           MUST complete before Step 5 touches profile folders.
+#           Windows locks profile files while any Chrome process
+#           is alive — even background helpers with no window.
 # ═════════════════════════════════════════════════════════════
-Write-Status "Stopping all Chrome processes..."
-$ChromeProcs = Get-Process -Name "chrome", "chrome_crashpad_handler" -ErrorAction SilentlyContinue
-if ($ChromeProcs) {
-    $ChromeProcs | Stop-Process -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 2
-    Write-Success "Chrome processes terminated."
+Write-Status "Terminating all Chrome-related processes..."
+
+$ChromeProcessNames = @(
+    "chrome",
+    "chrome_crashpad_handler",
+    "GoogleCrashHandler",
+    "GoogleCrashHandler64",
+    "GoogleUpdate",
+    "software_reporter_tool",
+    "elevation_service"
+)
+
+# Pass 1 — PowerShell Stop-Process
+foreach ($name in $ChromeProcessNames) {
+    Get-Process -Name $name -ErrorAction SilentlyContinue |
+        Stop-Process -Force -ErrorAction SilentlyContinue
+}
+
+# Pass 2 — taskkill /F /T kills child processes too, catches anything Stop-Process missed
+foreach ($name in $ChromeProcessNames) {
+    taskkill /F /IM "$name.exe" /T 2>&1 | Out-Null
+}
+
+# Pass 3 — catch any renamed/versioned helpers by their executable path
+Get-Process -ErrorAction SilentlyContinue | Where-Object {
+    try { $_.MainModule.FileName -like "*Google\Chrome*" } catch { $false }
+} | ForEach-Object {
+    taskkill /F /PID $_.Id /T 2>&1 | Out-Null
+}
+
+# Give Windows time to fully release all file handles
+Write-Status "Waiting for file handles to release..."
+Start-Sleep -Seconds 5
+
+# Safety check — if Chrome is somehow still alive, stop and warn the user
+$StillRunning = Get-Process -Name "chrome" -ErrorAction SilentlyContinue
+if ($StillRunning) {
+    Write-Fail "Chrome is still running after all kill attempts."
+    Write-Fail "Please close Chrome manually then re-run this script."
+    exit 1
 } else {
-    Write-Skip "No Chrome processes were running."
+    Write-Success "All Chrome processes terminated."
 }
 
 # ═════════════════════════════════════════════════════════════
 #  STEP 3 — Run the official uninstaller (if present)
 # ═════════════════════════════════════════════════════════════
+Write-Host ""
 Write-Status "Looking for Chrome's built-in uninstaller..."
 
 $UninstallerPaths = @(
@@ -174,7 +209,6 @@ $InstallDirs = @(
 )
 foreach ($dir in $InstallDirs) { Remove-IfExists $dir }
 
-# Google update / shared Google folder (only remove if Chrome was the last product)
 $GoogleDirs = @(
     "$env:ProgramFiles\Google\Update",
     "${env:ProgramFiles(x86)}\Google\Update",
@@ -184,11 +218,11 @@ foreach ($dir in $GoogleDirs) { Remove-IfExists $dir }
 
 # ═════════════════════════════════════════════════════════════
 #  STEP 5 — Remove user profile / app data
+#           Safe to run now — all processes killed in Step 2
 # ═════════════════════════════════════════════════════════════
 Write-Host ""
 Write-Status "Removing user profile and cached data..."
 
-# Current user
 $UserDataPaths = @(
     "$env:LOCALAPPDATA\Google\Chrome",
     "$env:APPDATA\Google\Chrome",
@@ -198,7 +232,7 @@ $UserDataPaths = @(
 )
 foreach ($p in $UserDataPaths) { Remove-IfExists $p }
 
-# All other user profiles on the machine
+# All other user profiles on this machine
 $UserProfiles = Get-ChildItem "C:\Users" -Directory -ErrorAction SilentlyContinue
 foreach ($profile in $UserProfiles) {
     $OtherUserPaths = @(
@@ -216,41 +250,27 @@ Write-Host ""
 Write-Status "Scrubbing registry entries..."
 
 $RegistryKeys = @(
-    # Uninstall entries
     "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Google Chrome",
     "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Google Chrome",
     "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Google Chrome",
-
-    # App Paths
     "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe",
-
-    # Google / Chrome software keys
     "HKLM:\SOFTWARE\Google\Chrome",
     "HKLM:\SOFTWARE\WOW6432Node\Google\Chrome",
     "HKCU:\SOFTWARE\Google\Chrome",
-
-    # Google Update keys related to Chrome
     "HKLM:\SOFTWARE\Google\Update",
     "HKLM:\SOFTWARE\WOW6432Node\Google\Update",
     "HKCU:\SOFTWARE\Google\Update",
-
-    # Policies
     "HKLM:\SOFTWARE\Policies\Google\Chrome",
     "HKLM:\SOFTWARE\WOW6432Node\Policies\Google\Chrome",
     "HKCU:\SOFTWARE\Policies\Google\Chrome",
-
-    # Protocol handlers / capabilities
     "HKCR:\ChromeHTML",
     "HKCR:\ChromiumHTM",
-
-    # Start menu / shell integration
     "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\FileExts\.html\UserChoice",
     "HKCU:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Compatibility Assistant\Store"
 )
-
 foreach ($key in $RegistryKeys) { Remove-RegIfExists $key }
 
-# Remove Chrome from the MUICache (recently used apps list)
+# MUICache cleanup
 Write-Status "Cleaning MUICache entries for Chrome..."
 $MUICachePath = "HKCU:\SOFTWARE\Classes\Local Settings\Software\Microsoft\Windows\Shell\MuiCache"
 if (Test-Path $MUICachePath) {
@@ -324,7 +344,6 @@ $ShortcutPaths = @(
 )
 foreach ($s in $ShortcutPaths) { Remove-IfExists $s }
 
-# All other users' desktops
 foreach ($profile in $UserProfiles) {
     Remove-IfExists "$($profile.FullName)\Desktop\Google Chrome.lnk"
     Remove-IfExists "$($profile.FullName)\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Google Chrome.lnk"
@@ -347,7 +366,7 @@ foreach ($r in $RegInstallPaths) {
 
 if ($Remnants.Count -eq 0) {
     Write-Host ""
-    Write-Host "  ✔  Google Chrome has been completely removed." -ForegroundColor Green
+    Write-Host "  v  Google Chrome has been completely removed." -ForegroundColor Green
 } else {
     Write-Host ""
     Write-Fail "Some remnants could not be removed:"
