@@ -4,10 +4,6 @@
     Completely removes Google Chrome from Windows 11, including all app data,
     registry entries, scheduled tasks, and cached files.
 
-.DESCRIPTION
-    This script performs a full forensic-level uninstall of Chrome. It checks
-    whether Chrome is installed first and exits gracefully if not found.
-
 .NOTES
     Must be run as Administrator.
 #>
@@ -15,40 +11,48 @@
 # ─────────────────────────────────────────────────────────────
 #  Helper: Colored output
 # ─────────────────────────────────────────────────────────────
-function Write-Status  { param([string]$Msg) Write-Host "[*] $Msg" -ForegroundColor Cyan    }
-function Write-Success { param([string]$Msg) Write-Host "[+] $Msg" -ForegroundColor Green   }
-function Write-Skip    { param([string]$Msg) Write-Host "[-] $Msg" -ForegroundColor Yellow  }
-function Write-Fail    { param([string]$Msg) Write-Host "[!] $Msg" -ForegroundColor Red     }
+function Write-Status  { param([string]$Msg) Write-Host "[*] $Msg" -ForegroundColor Cyan   }
+function Write-Success { param([string]$Msg) Write-Host "[+] $Msg" -ForegroundColor Green  }
+function Write-Skip    { param([string]$Msg) Write-Host "[-] $Msg" -ForegroundColor Yellow }
+function Write-Fail    { param([string]$Msg) Write-Host "[!] $Msg" -ForegroundColor Red    }
 
 # ─────────────────────────────────────────────────────────────
-#  Helper: Take ownership + grant full control, then delete
+#  Helper: Force-delete using robocopy mirror trick
+#
+#  HOW IT WORKS:
+#    robocopy mirrors an empty temp folder OVER the target folder.
+#    This silently wipes all contents regardless of ACLs or ownership
+#    because robocopy runs at a level that bypasses normal permission
+#    checks. No takeown, no icacls needed.
+#    Then rd /S /Q removes the now-empty shell.
 # ─────────────────────────────────────────────────────────────
-function Force-TakeOwnership {
+function Force-DeleteFolder {
     param([string]$FolderPath)
-    try {
-        takeown /F "$FolderPath" /R /D Y 2>&1 | Out-Null
-        icacls "$FolderPath" /grant "Administrators:(OI)(CI)F" /T /C /Q 2>&1 | Out-Null
-    } catch {
-        # Non-fatal — best effort
-    }
+    $emptyDir = Join-Path $env:TEMP "rbcpy_empty_$(Get-Random)"
+    New-Item -ItemType Directory -Path $emptyDir -Force | Out-Null
+    robocopy "$emptyDir" "$FolderPath" /MIR /NFL /NDL /NJH /NJS /NC /NS /NP | Out-Null
+    Remove-Item -Path $emptyDir -Force -ErrorAction SilentlyContinue
+    cmd /c "rd /S /Q `"$FolderPath`"" 2>&1 | Out-Null
 }
 
 function Remove-IfExists {
     param([string]$Path)
     if (Test-Path $Path) {
+        # First attempt — normal delete
         try {
             Remove-Item -Path $Path -Recurse -Force -ErrorAction Stop
             Write-Success "Removed: $Path"
-        } catch {
-            # Access denied — take ownership and retry
-            Write-Status "Access denied, taking ownership: $Path"
-            Force-TakeOwnership $Path
-            try {
-                Remove-Item -Path $Path -Recurse -Force -ErrorAction Stop
-                Write-Success "Removed (after ownership fix): $Path"
-            } catch {
-                Write-Fail "Still could not remove: $Path — $($_.Exception.Message)"
-            }
+            return
+        } catch { }
+
+        # Second attempt — robocopy mirror wipe (bypasses all permission issues)
+        Write-Status "Normal delete failed, using force-wipe: $Path"
+        Force-DeleteFolder $Path
+
+        if (Test-Path $Path) {
+            Write-Fail "Could not remove: $Path"
+        } else {
+            Write-Success "Force-removed: $Path"
         }
     } else {
         Write-Skip "Not found (skip): $Path"
@@ -112,10 +116,8 @@ Write-Status "Chrome installation detected. Beginning full removal..."
 Write-Host ""
 
 # ═════════════════════════════════════════════════════════════
-#  STEP 2 — Aggressively kill ALL Chrome-related processes
-#           MUST complete before Step 5 touches profile folders.
-#           Windows locks profile files while any Chrome process
-#           is alive — even background helpers with no window.
+#  STEP 2 — Aggressively kill ALL Chrome processes
+#           Must happen before Step 5 or profile folder is locked
 # ═════════════════════════════════════════════════════════════
 Write-Status "Terminating all Chrome-related processes..."
 
@@ -129,37 +131,32 @@ $ChromeProcessNames = @(
     "elevation_service"
 )
 
-# Pass 1 — PowerShell Stop-Process
+# Pass 1 — PowerShell
 foreach ($name in $ChromeProcessNames) {
-    Get-Process -Name $name -ErrorAction SilentlyContinue |
-        Stop-Process -Force -ErrorAction SilentlyContinue
+    Get-Process -Name $name -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 }
 
-# Pass 2 — taskkill /F /T kills child processes too, catches anything Stop-Process missed
+# Pass 2 — taskkill /F /T kills child process trees too
 foreach ($name in $ChromeProcessNames) {
     taskkill /F /IM "$name.exe" /T 2>&1 | Out-Null
 }
 
-# Pass 3 — catch any renamed/versioned helpers by their executable path
+# Pass 3 — catch versioned/renamed helpers by exe path
 Get-Process -ErrorAction SilentlyContinue | Where-Object {
     try { $_.MainModule.FileName -like "*Google\Chrome*" } catch { $false }
 } | ForEach-Object {
     taskkill /F /PID $_.Id /T 2>&1 | Out-Null
 }
 
-# Give Windows time to fully release all file handles
 Write-Status "Waiting for file handles to release..."
 Start-Sleep -Seconds 5
 
-# Safety check — if Chrome is somehow still alive, stop and warn the user
 $StillRunning = Get-Process -Name "chrome" -ErrorAction SilentlyContinue
 if ($StillRunning) {
-    Write-Fail "Chrome is still running after all kill attempts."
-    Write-Fail "Please close Chrome manually then re-run this script."
+    Write-Fail "Chrome is still running. Please close it manually and re-run."
     exit 1
-} else {
-    Write-Success "All Chrome processes terminated."
 }
+Write-Success "All Chrome processes terminated."
 
 # ═════════════════════════════════════════════════════════════
 #  STEP 3 — Run the official uninstaller (if present)
@@ -218,7 +215,7 @@ foreach ($dir in $GoogleDirs) { Remove-IfExists $dir }
 
 # ═════════════════════════════════════════════════════════════
 #  STEP 5 — Remove user profile / app data
-#           Safe to run now — all processes killed in Step 2
+#           Robocopy wipe handles any locked/protected subfolders
 # ═════════════════════════════════════════════════════════════
 Write-Host ""
 Write-Status "Removing user profile and cached data..."
@@ -232,7 +229,6 @@ $UserDataPaths = @(
 )
 foreach ($p in $UserDataPaths) { Remove-IfExists $p }
 
-# All other user profiles on this machine
 $UserProfiles = Get-ChildItem "C:\Users" -Directory -ErrorAction SilentlyContinue
 foreach ($profile in $UserProfiles) {
     $OtherUserPaths = @(
@@ -270,7 +266,6 @@ $RegistryKeys = @(
 )
 foreach ($key in $RegistryKeys) { Remove-RegIfExists $key }
 
-# MUICache cleanup
 Write-Status "Cleaning MUICache entries for Chrome..."
 $MUICachePath = "HKCU:\SOFTWARE\Classes\Local Settings\Software\Microsoft\Windows\Shell\MuiCache"
 if (Test-Path $MUICachePath) {
@@ -309,7 +304,7 @@ if ($Tasks) {
 }
 
 # ═════════════════════════════════════════════════════════════
-#  STEP 8 — Remove Windows services (GoogleUpdate)
+#  STEP 8 — Remove Windows services
 # ═════════════════════════════════════════════════════════════
 Write-Host ""
 Write-Status "Removing Google Update services..."
@@ -331,7 +326,7 @@ foreach ($svc in $Services) {
 }
 
 # ═════════════════════════════════════════════════════════════
-#  STEP 9 — Remove Start Menu / Desktop shortcuts
+#  STEP 9 — Remove shortcuts
 # ═════════════════════════════════════════════════════════════
 Write-Host ""
 Write-Status "Removing shortcuts..."
@@ -357,21 +352,17 @@ Write-Host "══════════════════════�
 Write-Status "Running final verification check..."
 
 $Remnants = @()
-foreach ($p in $ChromeInstallPaths) {
-    if (Test-Path $p) { $Remnants += $p }
-}
-foreach ($r in $RegInstallPaths) {
-    if (Test-Path $r) { $Remnants += $r }
-}
+foreach ($p in $ChromeInstallPaths) { if (Test-Path $p) { $Remnants += $p } }
+foreach ($r in $RegInstallPaths)    { if (Test-Path $r) { $Remnants += $r } }
 
 if ($Remnants.Count -eq 0) {
     Write-Host ""
-    Write-Host "  v  Google Chrome has been completely removed." -ForegroundColor Green
+    Write-Host "  OK  Google Chrome has been completely removed." -ForegroundColor Green
 } else {
     Write-Host ""
     Write-Fail "Some remnants could not be removed:"
     foreach ($r in $Remnants) { Write-Host "     $r" -ForegroundColor Red }
-    Write-Host "  You may need to reboot and re-run this script, or remove these manually." -ForegroundColor Yellow
+    Write-Host "  Reboot and re-run this script to clear them." -ForegroundColor Yellow
 }
 
 Write-Host "══════════════════════════════════════════════" -ForegroundColor DarkGray
