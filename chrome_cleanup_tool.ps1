@@ -19,12 +19,8 @@ function Write-Fail    { param([string]$Msg) Write-Host "[!] $Msg" -ForegroundCo
 # ─────────────────────────────────────────────────────────────
 #  Helper: Force-delete using robocopy mirror trick
 #
-#  HOW IT WORKS:
-#    robocopy mirrors an empty temp folder OVER the target folder.
-#    This silently wipes all contents regardless of ACLs or ownership
-#    because robocopy runs at a level that bypasses normal permission
-#    checks. No takeown, no icacls needed.
-#    Then rd /S /Q removes the now-empty shell.
+#  Mirrors an empty temp folder over the target, wiping all
+#  contents regardless of ACLs. Then removes the empty shell.
 # ─────────────────────────────────────────────────────────────
 function Force-DeleteFolder {
     param([string]$FolderPath)
@@ -38,14 +34,12 @@ function Force-DeleteFolder {
 function Remove-IfExists {
     param([string]$Path)
     if (Test-Path $Path) {
-        # First attempt — normal delete
         try {
             Remove-Item -Path $Path -Recurse -Force -ErrorAction Stop
             Write-Success "Removed: $Path"
             return
         } catch { }
 
-        # Second attempt — robocopy mirror wipe (bypasses all permission issues)
         Write-Status "Normal delete failed, using force-wipe: $Path"
         Force-DeleteFolder $Path
 
@@ -116,9 +110,36 @@ Write-Status "Chrome installation detected. Beginning full removal..."
 Write-Host ""
 
 # ═════════════════════════════════════════════════════════════
-#  STEP 2 — Aggressively kill ALL Chrome processes
-#           Must happen before Step 5 or profile folder is locked
+#  STEP 2 — Stop Chrome services FIRST
+#           Services run under SYSTEM and hold file locks that
+#           taskkill cannot reach. Must be stopped before we
+#           try to kill processes or delete the AppData folder.
 # ═════════════════════════════════════════════════════════════
+Write-Status "Stopping Chrome-related Windows services..."
+
+$ChromeServices = @(
+    "gupdate",          # Google Update (runs on demand)
+    "gupdatem",         # Google Update (scheduled)
+    "GoogleChromeElevationService",  # elevation_service.exe — the main AppData locker
+    "cbdhsvc*",         # Clipboard sync helper (sometimes tied to Chrome profile)
+    "OneSyncSvc*"       # Profile sync (can hold AppData handles)
+)
+
+foreach ($svc in $ChromeServices) {
+    Get-Service -Name $svc -ErrorAction SilentlyContinue | ForEach-Object {
+        try {
+            Stop-Service -Name $_.Name -Force -ErrorAction Stop
+            Write-Success "Service stopped: $($_.Name)"
+        } catch {
+            Write-Skip "Could not stop service (may already be stopped): $($_.Name)"
+        }
+    }
+}
+
+# ═════════════════════════════════════════════════════════════
+#  STEP 3 — Kill ALL Chrome-related processes
+# ═════════════════════════════════════════════════════════════
+Write-Host ""
 Write-Status "Terminating all Chrome-related processes..."
 
 $ChromeProcessNames = @(
@@ -131,23 +152,24 @@ $ChromeProcessNames = @(
     "elevation_service"
 )
 
-# Pass 1 — PowerShell
+# Pass 1 — PowerShell Stop-Process
 foreach ($name in $ChromeProcessNames) {
     Get-Process -Name $name -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 }
 
-# Pass 2 — taskkill /F /T kills child process trees too
+# Pass 2 — taskkill /F /T kills entire child process trees
 foreach ($name in $ChromeProcessNames) {
     taskkill /F /IM "$name.exe" /T 2>&1 | Out-Null
 }
 
-# Pass 3 — catch versioned/renamed helpers by exe path
+# Pass 3 — catch any versioned/renamed helpers by their exe path
 Get-Process -ErrorAction SilentlyContinue | Where-Object {
     try { $_.MainModule.FileName -like "*Google\Chrome*" } catch { $false }
 } | ForEach-Object {
     taskkill /F /PID $_.Id /T 2>&1 | Out-Null
 }
 
+# Wait for OS to fully release all file handles
 Write-Status "Waiting for file handles to release..."
 Start-Sleep -Seconds 5
 
@@ -159,7 +181,7 @@ if ($StillRunning) {
 Write-Success "All Chrome processes terminated."
 
 # ═════════════════════════════════════════════════════════════
-#  STEP 3 — Run the official uninstaller (if present)
+#  STEP 4 — Run the official uninstaller (if present)
 # ═════════════════════════════════════════════════════════════
 Write-Host ""
 Write-Status "Looking for Chrome's built-in uninstaller..."
@@ -194,7 +216,7 @@ if (-not $UninstallerFound) {
 }
 
 # ═════════════════════════════════════════════════════════════
-#  STEP 4 — Remove installation directories
+#  STEP 5 — Remove installation directories
 # ═════════════════════════════════════════════════════════════
 Write-Host ""
 Write-Status "Removing Chrome installation folders..."
@@ -214,8 +236,7 @@ $GoogleDirs = @(
 foreach ($dir in $GoogleDirs) { Remove-IfExists $dir }
 
 # ═════════════════════════════════════════════════════════════
-#  STEP 5 — Remove user profile / app data
-#           Robocopy wipe handles any locked/protected subfolders
+#  STEP 6 — Remove user profile / app data
 # ═════════════════════════════════════════════════════════════
 Write-Host ""
 Write-Status "Removing user profile and cached data..."
@@ -240,7 +261,7 @@ foreach ($profile in $UserProfiles) {
 }
 
 # ═════════════════════════════════════════════════════════════
-#  STEP 6 — Remove registry entries
+#  STEP 7 — Remove registry entries
 # ═════════════════════════════════════════════════════════════
 Write-Host ""
 Write-Status "Scrubbing registry entries..."
@@ -282,7 +303,7 @@ if (Test-Path $MUICachePath) {
 }
 
 # ═════════════════════════════════════════════════════════════
-#  STEP 7 — Remove scheduled tasks
+#  STEP 8 — Remove scheduled tasks
 # ═════════════════════════════════════════════════════════════
 Write-Host ""
 Write-Status "Removing Chrome scheduled tasks..."
@@ -304,21 +325,25 @@ if ($Tasks) {
 }
 
 # ═════════════════════════════════════════════════════════════
-#  STEP 8 — Remove Windows services
+#  STEP 9 — Delete Chrome services entirely (not just stop them)
 # ═════════════════════════════════════════════════════════════
 Write-Host ""
-Write-Status "Removing Google Update services..."
+Write-Status "Deleting Google/Chrome services..."
 
-$Services = @("gupdate", "gupdatem")
-foreach ($svc in $Services) {
+$ServicesToDelete = @(
+    "gupdate",
+    "gupdatem",
+    "GoogleChromeElevationService"
+)
+foreach ($svc in $ServicesToDelete) {
     $s = Get-Service -Name $svc -ErrorAction SilentlyContinue
     if ($s) {
         try {
             Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
             sc.exe delete $svc | Out-Null
-            Write-Success "Service removed: $svc"
+            Write-Success "Service deleted: $svc"
         } catch {
-            Write-Fail "Could not remove service: $svc — $($_.Exception.Message)"
+            Write-Fail "Could not delete service: $svc — $($_.Exception.Message)"
         }
     } else {
         Write-Skip "Service not found (skip): $svc"
@@ -326,7 +351,7 @@ foreach ($svc in $Services) {
 }
 
 # ═════════════════════════════════════════════════════════════
-#  STEP 9 — Remove shortcuts
+#  STEP 10 — Remove shortcuts
 # ═════════════════════════════════════════════════════════════
 Write-Host ""
 Write-Status "Removing shortcuts..."
@@ -345,7 +370,7 @@ foreach ($profile in $UserProfiles) {
 }
 
 # ═════════════════════════════════════════════════════════════
-#  STEP 10 — Final verification
+#  STEP 11 — Final verification
 # ═════════════════════════════════════════════════════════════
 Write-Host ""
 Write-Host "══════════════════════════════════════════════" -ForegroundColor DarkGray
